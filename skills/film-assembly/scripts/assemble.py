@@ -1,0 +1,212 @@
+"""Assemble a rough cut from a JSON shot list. Self-contained: numpy, scipy, opencv, ffmpeg, and grade.sh next to this file.
+
+usage: python3 assemble.py TIMELINE.json OUT_DIR        (graded segments are cached in OUT_DIR/seg/<id>.mov — delete
+                                                         one to redo that shot; copy unchanged ones between versions)
+TIMELINE.json:
+{
+  "shots": [
+    {"id": "S04", "kind": "clip", "src": "wall.mp4", "ss": 0, "sdur": 8, "dur": 14,     # retime 8 s of source to 14 s
+     "amb": -32,                      # keep the clip's own sound as a bed at this LUFS (omit/null = mute)
+     "vert": -0.4,                    # vertical footage: show it whole (x1.35) over a blurred fill; -1 top .. 1 bottom
+     "grade": ["-y", "0.2"],          # extra grade.sh flags
+     "vo": [["lines/VO01a.wav", 0.8, "中文", "English"]],   # [file, offset in shot, subtitle zh, subtitle en]
+     "card": ["chapter_alpha.mov", 0.5]},                  # alpha overlay [file, offset in shot]
+    {"id": "S09", "kind": "still", "src": "photo.jpg", "dur": 13,
+     "kb": [[0, 1.0, 0.5, 0.5], [9, 2.5, 0.8, 0.45], [10.5, 1.0, 0.5, 0.5]]},   # keyframes [t, zoom, cx, cy]; zoom <= 2.5
+    {"id": "S02", "kind": "ui", "src": "title.mov", "wav": "title.wav", "ss": 1, "dur": 8},
+    {"id": "S12", "kind": "clip", "src": "nave.mp4", "sdur": 7, "dur": 7, "silence": true},   # only room tone survives
+    {"id": "S25", "kind": "montage", "dur": 8, "cuts": [["S10", 4, 1.2], ["S08", 2, 0.5]]}    # [shot, t in its seg, len]
+  ],
+  "cues": [["score/A.flac", "S02", 0, "S06", 2.0]],   # [file, first shot, offset into file, stop at start of shot, fade-out s]
+  "fade_out": 1.2, "target_lufs": -18, "vo_lufs": -16, "music_lufs": -23, "duck_db": -6
+}
+Writes OUT_DIR/cut.mp4 (H.264 1920x804 24 fps + AAC), cut_mix.wav, cut.srt, timeline.json (real start times).
+"""
+import os, sys, json, math, subprocess
+import numpy as np
+import cv2
+from scipy.signal import butter, sosfilt
+from scipy.ndimage import maximum_filter1d, uniform_filter1d
+
+W, H, FPS, SR = 1920, 804, 24, 48000
+GRADE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grade.sh")
+PRORES = ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le"]
+
+
+def run(cmd): subprocess.run(cmd, check=True)
+def db(x): return 10 ** (x / 20)
+def probe_dur(p): return float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p]))
+def has_audio(p): return bool(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", p], capture_output=True, text=True).stdout.strip())
+def ease(x): x = min(max(x, 0.0), 1.0); return x * x * (3 - 2 * x)
+
+
+# ------------------------------------------------------------------ audio helpers
+def load_audio(path, dur=None):
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"],
+                         capture_output=True, check=True).stdout
+    a = np.frombuffer(raw, np.float32).reshape(-1, 2).copy()
+    if dur is not None:
+        n = int(round(dur * SR)); a = np.vstack([a, np.zeros((max(0, n - len(a)), 2), np.float32)])[:n]
+    return a
+
+
+def write_wav(path, buf):
+    tmp = path + ".f32"; buf.astype("<f4").tofile(tmp)
+    run(["ffmpeg", "-y", "-v", "error", "-f", "f32le", "-ar", str(SR), "-ac", "2", "-i", tmp, "-c:a", "pcm_s24le", path]); os.remove(tmp)
+
+
+def lufs(buf):
+    tmp = "/tmp/_assemble_meas.wav"; write_wav(tmp, buf)
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", tmp, "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+                         capture_output=True, text=True).stderr
+    os.remove(tmp); js = json.loads(out[out.rindex("{"):out.rindex("}") + 1]); return float(js["input_i"])
+
+
+def at_lufs(a, target):
+    li = lufs(a); return a * db(target - li) if np.isfinite(li) else a
+
+
+def room_tone(n, rms_db=-50.0):
+    """never digital silence: cinemas read 0 dBFS-silence as a projection fault"""
+    x = np.random.default_rng(50).standard_normal((n, 2)).astype(np.float32)
+    x = sosfilt(butter(1, 900, fs=SR, output="sos"), x, axis=0)
+    x = sosfilt(butter(2, 40, btype="high", fs=SR, output="sos"), x, axis=0)
+    return (x * db(rms_db) / np.sqrt((x ** 2).mean())).astype(np.float32)
+
+
+# ------------------------------------------------------------------ picture
+def kb_at(keys, t):
+    for (t0, *a), (t1, *b) in zip(keys, keys[1:]):
+        if t <= t1:
+            e = ease((t - t0) / max(t1 - t0, 1e-6)); return [x + (y - x) * e for x, y in zip(a, b)]
+    return keys[-1][1:]
+
+
+def ken_burns(src, out, dur, keys):
+    img = cv2.cvtColor(cv2.imread(src, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    ih, iw = img.shape[:2]; s0 = max(W / iw, H / ih)
+    p = subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS),
+                          "-i", "-"] + PRORES + [out], stdin=subprocess.PIPE)
+    for f in range(int(round(dur * FPS))):
+        z, cx, cy = kb_at(keys, f / FPS); s = s0 * z
+        cx = min(max(cx, W / (2 * s * iw)), 1 - W / (2 * s * iw)); cy = min(max(cy, H / (2 * s * ih)), 1 - H / (2 * s * ih))
+        M = np.float32([[s, 0, W / 2 - s * cx * iw], [0, s, H / 2 - s * cy * ih]])
+        p.stdin.write(cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT).tobytes())
+    p.stdin.close(); p.wait()
+
+
+def atempo(r):
+    parts = []
+    while r < 0.5: parts.append("atempo=0.5"); r /= 0.5
+    while r > 2.0: parts.append("atempo=2.0"); r /= 2.0
+    return ",".join(parts + [f"atempo={r:.5f}"])
+
+
+def build(s, seg):
+    out = f"{seg}/{s['id']}.mov"
+    if os.path.exists(out): return out
+    k = s["kind"]
+    if k == "ui":
+        run(["ffmpeg", "-y", "-v", "error", "-ss", str(s.get("ss", 0)), "-i", s["src"], "-vf", "fps=24,format=yuv422p10le,setsar=1",
+             "-an"] + PRORES + ["-t", str(s["dur"]), out]); return out
+    if k == "black":
+        run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=0x010101:s={W}x{H}:r=24:d={s['dur']}"] + PRORES + [out]); return out
+    tmp = f"{seg}/{s['id']}_pre.mov"
+    if k == "still":
+        ken_burns(s["src"], tmp, s["dur"], s.get("kb", [[0, 1.0, 0.5, 0.5], [s["dur"], 1.06, 0.5, 0.5]]))
+    else:
+        f = s["dur"] / s["sdur"]; vf = f"setpts=(PTS-STARTPTS)*{f:.6f}"; a = has_audio(s["src"])
+        if s.get("vert") is not None:   # a 2.39 strip of a 9:16 frame is a 1.8x blow-up: show the frame instead
+            fh = int(round(H * 1.35)); y = s["vert"]
+            vf += (f",split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=40,"
+                   f"eq=brightness=-0.18:saturation=0.7[bg];[b]scale=-2:{fh},crop=iw:{H}:0:(ih-{H})*(0.5+({y})/2)[fg];"
+                   f"[bg][fg]overlay=(W-w)/2:0,setsar=1[vout]")
+            v = ["-filter_complex", "[0:v]" + vf, "-map", "[vout]"] + (["-map", "0:a:0"] if a else [])
+        else:
+            v = ["-vf", vf]
+        au = ["-af", atempo(1 / f), "-c:a", "pcm_s24le", "-ar", "48000"] if a else ["-an"]
+        run(["ffmpeg", "-y", "-v", "error", "-ss", str(s.get("ss", 0)), "-t", str(s["sdur"]), "-i", s["src"]] + v + au
+            + ["-c:v", "prores_ks", "-profile:v", "3", "-t", str(s["dur"]), tmp])
+    run([GRADE, "-c", "prores"] + s.get("grade", []) + [tmp, out]); os.remove(tmp)
+    return out
+
+
+def srt_time(t):
+    ms = int(round(t * 1000)); return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+# ------------------------------------------------------------------ main
+def main(tl_path, out_dir):
+    tl = json.load(open(tl_path, encoding="utf-8")); shots = tl["shots"]
+    out_dir = os.path.abspath(out_dir)   # concat.txt resolves relative paths against its own directory
+    seg = os.path.join(out_dir, "seg"); os.makedirs(seg, exist_ok=True)
+    for s in shots:
+        s["seg"] = None if s["kind"] == "montage" else build(s, seg)
+        # lay the timeline on REAL lengths: retimed clips come out ~1 frame short and planned lengths drift
+        s["real"] = s["dur"] if s["seg"] is None else probe_dur(s["seg"])
+    start, t = {}, 0.0
+    for s in shots: start[s["id"]] = t; t += s["real"]
+    total = t; by = {s["id"]: s for s in shots}
+    lst = os.path.join(out_dir, "concat.txt")
+    with open(lst, "w") as fh:          # ProRes is intra-only, so concat inpoint/outpoint is frame-accurate
+        for s in shots:
+            if s["kind"] == "montage":
+                for sid, a, d in s["cuts"]: fh.write(f"file '{by[sid]['seg']}'\ninpoint {a:.4f}\noutpoint {a + d:.4f}\n")
+            else:
+                fh.write(f"file '{s['seg']}'\n")
+    base = os.path.join(out_dir, "base.mov"); run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", base])
+
+    n = int(round(total * SR)); vo, mus, fx = (np.zeros((n, 2), np.float32) for _ in range(3))
+    F = int(0.05 * SR); rin = (np.sin(np.linspace(0, math.pi / 2, F)) ** 2)[:, None]
+    def place(bus, a, t0):
+        i = int(round(t0 * SR)); a = a[:max(0, n - i)]; bus[i:i + len(a)] += a
+    subs = []
+    for s in shots:
+        t0 = start[s["id"]]
+        for f, off, *txt in s.get("vo", []):
+            a = at_lufs(load_audio(f), tl.get("vo_lufs", -16)); place(vo, a, t0 + off)
+            subs.append((t0 + off, t0 + off + len(a) / SR, txt))
+        if s["kind"] == "ui" and s.get("wav"):
+            a = load_audio(s["wav"], s["dur"] + s.get("ss", 0))[int(s.get("ss", 0) * SR):]; a[:F] *= rin; a[-F:] *= rin[::-1]; place(fx, a, t0)
+        if s["kind"] == "clip" and s.get("amb") is not None and has_audio(s["seg"]):
+            a = load_audio(s["seg"], s["real"])
+            if np.abs(a).max() > 1e-5: a = at_lufs(a, s["amb"]); a[:F] *= rin; a[-F:] *= rin[::-1]; place(fx, a, t0)
+    for f, s0, off, s1, fo in tl.get("cues", []):
+        L = start[s1] - start[s0]; a = load_audio(f, off + L)[int(off * SR):]
+        a = at_lufs(a, tl.get("music_lufs", -23))[: int(L * SR)]
+        k = int(fo * SR); a[-k:] *= (np.linspace(1, 0, k) ** 2)[:, None]; a[:F] *= rin; place(mus, a, start[s0])
+    act = uniform_filter1d(maximum_filter1d((np.abs(vo).max(1) > db(-45)).astype(np.float32), int(0.4 * SR)), int(0.15 * SR))
+    mus *= (1 - (1 - db(tl.get("duck_db", -6))) * act)[:, None]            # music ducks under narration
+    for s in shots:
+        if s.get("silence"):
+            i, j = int(start[s["id"]] * SR), int((start[s["id"]] + s["real"]) * SR)
+            for b in (vo, mus, fx): b[i:j] = 0
+    mix = vo + mus + fx; mix *= db(tl.get("target_lufs", -18) - lufs(mix))
+    lim = db(-1.5); hot = np.abs(mix) > lim * 0.7
+    mix[hot] = np.sign(mix[hot]) * (lim * 0.7 + lim * 0.3 * np.tanh((np.abs(mix[hot]) - lim * 0.7) / (lim * 0.3)))
+    mix += room_tone(n)
+    fo = tl.get("fade_out", 0)
+    if fo: k = int(fo * SR); mix[-k:] *= (np.linspace(1, 0, k) ** 2)[:, None]
+    wav = os.path.join(out_dir, "cut_mix.wav"); write_wav(wav, mix)
+
+    with open(os.path.join(out_dir, "cut.srt"), "w", encoding="utf-8") as fh:
+        for i, (a, b, txt) in enumerate(sorted(subs, key=lambda x: x[0]), 1):
+            fh.write(f"{i}\n{srt_time(a)} --> {srt_time(b + 0.3)}\n" + "\n".join(txt) + "\n\n")
+
+    ins = ["-i", base]; fc = "[0:v]format=yuv444p10le[v0]"; k = 0
+    for s in shots:
+        if s.get("card"):
+            k += 1; ins += ["-i", s["card"][0]]
+            fc += f";[{k}:v]setpts=PTS-STARTPTS+{start[s['id']] + s['card'][1]:.4f}/TB[o{k}];[v{k - 1}][o{k}]overlay=format=auto:eof_action=pass[v{k}]"
+    fc += (f";[v{k}]fade=t=out:st={total - fo:.3f}:d={fo}" if fo else f";[v{k}]null") + ",format=yuv420p[v]"
+    out = os.path.join(out_dir, "cut.mp4")
+    run(["ffmpeg", "-y", "-v", "error"] + ins + ["-i", wav, "-filter_complex", fc, "-map", "[v]", "-map", f"{k + 1}:a",
+         "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-color_primaries", "bt709",
+         "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "aac", "-b:a", "256k", "-r", "24", "-movflags", "+faststart",
+         "-t", f"{total:.3f}", out])
+    json.dump(start, open(os.path.join(out_dir, "timeline.json"), "w"), indent=1)
+    print(f"-> {out}  ({total:.1f}s)")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
