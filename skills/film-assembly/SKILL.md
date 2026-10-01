@@ -1,6 +1,6 @@
 ---
 name: film-assembly
-description: Build a graded rough cut (1920x804 2.39:1, 24 fps) from a JSON shot list — film-look grade, retiming, vertical phone footage over a blurred fill, gentle Ken Burns on stills, montage cuts, VO/music/ambience mix with ducking and room tone, silence beats, bilingual SRT, fade-out; segments cached per shot. Use for 剪辑, 粗剪, rough cut, assemble, 调色, 混音, and for revising a cut from timecoded notes.
+description: Build a graded rough cut (1920x804 2.39:1, 24 fps) from a JSON shot list — film-look grade, retiming, vertical phone footage over a blurred fill, gentle Ken Burns on stills (portraits whole over a blurred fill), VO de-click + click scan, montage cuts, VO/music/ambience mix with ducking and room tone, silence beats, bilingual SRT, fade-out; segments cached per shot. Use for 剪辑, 粗剪, rough cut, assemble, 调色, 混音, and for revising a cut from timecoded notes.
 ---
 
 # Film assembly
@@ -14,7 +14,9 @@ and crops any input to 1920×804 (`-y/-x` pick the crop position). Run both on t
 | situation | do | not |
 |---|---|---|
 | 9:16 phone clip | `"vert": y` — whole frame ×1.35 centred over a blurred, darkened copy | a 2.39 strip (≈1.8× blow-up) |
-| still photo | keyframed Ken Burns, zoom ≤ 2.5×, mostly 1.0–1.15× | pushing "into the brushstrokes" at 8× |
+| portrait (3:4) still | default `fit`: whole photo, zoom vs fit-height (1.0–1.12), over a blurred fill | cover-crop to 2.39 — only ~31% of the height survives; "放大太大" |
+| landscape still | keyframed Ken Burns vs cover-fit, mostly 1.0–1.15×, push to a detail ≤ 1.6× | 2.5× (still "too zoomed" in 为君载 v4), 8× "into the brushstrokes" |
+| sound design for an object on screen (candle, lighter…) | real recorded sound, or nothing | synthesized noise ticks — read as a lighter flick / glitch |
 | generated push-in that drifts | use the first seconds, retimed longer | the whole take |
 | low-res or wrong-orientation source | regenerate at the right aspect | upscale a crop |
 | a shot that must be silent | `"silence": true` (room tone survives) | digital zero |
@@ -36,6 +38,12 @@ Check each source's resolution/orientation (`ffprobe`) before placing it.
 4. After an interrupted build, check the newest segment decodes to the end before trusting the cache.
 
 ## QA before showing anyone
+- Every VO take goes through `declick()` (built into assemble.py): TTS takes routinely carry an onset pop and ticks in
+  their lead-in silence/pauses — VO07a of 为君载 had a 0 dBFS click the user heard as a lighter at 1:33. Read the
+  `declick` log; if a take needed a `hot` cap, prefer its twin take.
+- Read the `click scan` line after the mix: map each hit to its shot/source; anything that is not a score attack or a
+  consonant gets fixed before the user hears it. Don't rely on the user to find clicks.
+- Contact sheet must include a frame of every still at its tightest zoom — compare visible area to the photo.
 - One mid-frame per shot on a labelled contact sheet (catches wrong crops — a tilt framed on empty sky).
 - Per-shot RMS of the mix: silent beats ≈ −50 dB, VO shots ≈ −17…−20 dB; integrated ≈ −18 LUFS, peak ≤ −1 dBTP.
 - Faces: every recognisable passer-by blurred or cropped out; note what is still open.

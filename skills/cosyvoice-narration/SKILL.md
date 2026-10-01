@@ -24,6 +24,9 @@ Two takes per line (`<id>a.wav` seed 0, `<id>b.wav` seed 1), 1–2 s each; exist
 "synthesis text too short than prompt" is a warning, not an error.
 
 ## QA
+- Scan every take for artifacts outside the speech: CosyVoice often emits a ~100 ms burst at 0 s (−3…−27 dBFS) and
+  isolated ≤ 40 ms ticks in the lead-in silence or pauses — one was 0 dBFS and sounded like a lighter in the cut.
+  film-assembly's `declick()` gates these; still prefer the twin take when a click sits *inside* the speech.
 - List every take's duration side by side: a take much shorter than its twin (5.8 s vs 8.6 s) has usually dropped words.
 - Listen to all of them (or transcribe) before the cut — nobody else will catch a mispronounced place name.
 - Pick per line by fit to the picture, not only quality: a shorter take can keep a line from spilling into a shot that

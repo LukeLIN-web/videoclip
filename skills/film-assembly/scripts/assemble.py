@@ -12,7 +12,9 @@ TIMELINE.json:
      "vo": [["lines/VO01a.wav", 0.8, "中文", "English"]],   # [file, offset in shot, subtitle zh, subtitle en]
      "card": ["chapter_alpha.mov", 0.5]},                  # alpha overlay [file, offset in shot]
     {"id": "S09", "kind": "still", "src": "photo.jpg", "dur": 13,
-     "kb": [[0, 1.0, 0.5, 0.5], [9, 2.5, 0.8, 0.45], [10.5, 1.0, 0.5, 0.5]]},   # keyframes [t, zoom, cx, cy]; zoom <= 2.5
+     "kb": [[0, 1.0, 0.5, 0.5], [9, 1.6, 0.8, 0.45], [10.5, 1.0, 0.5, 0.5]]},   # keyframes [t, zoom, cx, cy]; zoom <= 1.6
+     # portrait stills default to "fit": whole photo (zoom relative to fit-height) over a blurred fill;
+     # "fit": "cover" forces a 2.39 crop (only ~31% of a 3:4 portrait's height survives — users read it as over-zoomed)
     {"id": "S02", "kind": "ui", "src": "title.mov", "wav": "title.wav", "ss": 1, "dur": 8},
     {"id": "S12", "kind": "clip", "src": "nave.mp4", "sdur": 7, "dur": 7, "silence": true},   # only room tone survives
     {"id": "S25", "kind": "montage", "dur": 8, "cuts": [["S10", 4, 1.2], ["S08", 2, 0.5]]}    # [shot, t in its seg, len]
@@ -66,6 +68,50 @@ def at_lufs(a, target):
     li = lufs(a); return a * db(target - li) if np.isfinite(li) else a
 
 
+def declick(a, name=""):
+    """TTS takes carry pops / ticks outside the speech (CosyVoice: a -3 dBFS burst at 0 s, a 0 dBFS click in the lead-in
+    silence — heard by the user as a lighter flick). On a 10 ms grid: (1) silence the lead-in before the first sustained
+    speech (>= 150 ms above median-20 dB; a TTS onset burst lasts ~100 ms), backing off to the last window under -50 dBFS so a soft consonant survives,
+    20 ms fade-in; (2) mute isolated bursts (<= 40 ms) between >= 100 ms of near-silence; (3) cap any window > 12 dB
+    over the speech median at median + 6 dB. Prints what it touched."""
+    a = a.copy(); k = int(0.01 * SR); n = len(a) // k
+    if n < 20: return a
+    pk = np.abs(a[:n * k]).max(1).reshape(n, k).max(1) + 1e-9; d = 20 * np.log10(pk)
+    med = np.median(d[d > -40]) if (d > -40).any() else -20
+    g = np.ones(n, np.float32); fixed = []
+    run6 = np.convolve(d > med - 20, np.ones(15), "valid") >= 15
+    first = int(np.argmax(run6)) if run6.any() else 0
+    while first > 0 and d[first - 1] >= -50: first -= 1
+    if first > 0 and (d[:first] > -55).any(): fixed.append(f"lead-in 0-{first * 0.01:.2f}s")
+    g[:max(0, first - 2)] = 0.0
+    quiet = d < -50; i = first
+    while i < n:
+        if quiet[i]: i += 1; continue
+        j = i
+        while j < n and not quiet[j]: j += 1
+        if j - i <= 4 and i >= 10 and j + 10 <= n and quiet[i - 10:i].all() and quiet[j:j + 10].all():
+            g[i:j] = 0.0; fixed.append(f"tick {i * 0.01:.2f}s")
+        i = j
+    hot = d > med + 12; g[hot] = np.minimum(g[hot], db(med + 6) / pk[hot]); fixed += [f"hot {i * 0.01:.2f}s" for i in np.nonzero(hot)[0]]
+    if fixed: print(f"  declick {name}:", ", ".join(fixed))
+    env = np.interp(np.arange(n * k), np.arange(n) * k + k / 2, uniform_filter1d(g, 2))
+    env[:first * k] = np.minimum(env[:first * k], np.clip((np.arange(first * k) - (first - 2) * k) / (2 * k), 0, 1))
+    a[:n * k] *= env[:, None].astype(np.float32); return a
+
+
+def click_scan(mix, top=6):
+    """QA: the sharpest transients in the final mix (2 ms high-passed RMS vs its 200 ms neighbourhood). Look up each
+    hit's source (timeline.json): a VO take outside its speech = artifact; a score attack after a rest = fine."""
+    h = sosfilt(butter(4, 2500, "hp", fs=SR, output="sos"), mix.mean(1)); w = int(0.002 * SR); n = len(h) // w
+    e = np.sqrt((h[:n * w].reshape(n, w) ** 2).mean(1)); r = e / (np.convolve(e, np.ones(100) / 100, "same") + 1e-6)
+    hits = []
+    for i in np.argsort(r)[::-1]:
+        t = i * w / SR
+        if all(abs(t - x) > 1 for x, _ in hits): hits.append((t, r[i]))
+        if len(hits) >= top: break
+    print("click scan:", ", ".join(f"{int(t // 60)}:{t % 60:05.2f} x{v:.0f}" for t, v in hits))
+
+
 def room_tone(n, rms_db=-50.0):
     """never digital silence: cinemas read 0 dBFS-silence as a projection fault"""
     x = np.random.default_rng(50).standard_normal((n, 2)).astype(np.float32)
@@ -82,16 +128,40 @@ def kb_at(keys, t):
     return keys[-1][1:]
 
 
-def ken_burns(src, out, dur, keys):
+def blur_fill(img):
+    """cover-fit, heavily blurred, desaturated and dimmed copy of img at W x H (float32)"""
+    ih, iw = img.shape[:2]; c = max(W / iw, H / ih)
+    bg = cv2.resize(img, (round(iw * c), round(ih * c)), interpolation=cv2.INTER_AREA)
+    y0, x0 = (bg.shape[0] - H) // 2, (bg.shape[1] - W) // 2; bg = bg[y0:y0 + H, x0:x0 + W]
+    bg = cv2.GaussianBlur(cv2.resize(bg, (W // 4, H // 4), interpolation=cv2.INTER_AREA), (0, 0), 10)
+    bg = cv2.resize(bg, (W, H), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+    g = bg.mean(axis=2, keepdims=True); return np.clip(g + (bg - g) * 0.7 - 46, 0, 255)
+
+
+def ken_burns(src, out, dur, keys, fit=None):
     img = cv2.cvtColor(cv2.imread(src, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-    ih, iw = img.shape[:2]; s0 = max(W / iw, H / ih)
+    ih, iw = img.shape[:2]
+    fit = fit or ("fit" if ih > iw else "cover")
+    s0 = H / ih if fit == "fit" else max(W / iw, H / ih); bg = blur_fill(img) if fit == "fit" else None
+    k = s0 * max(z for _, z, *_ in keys)
+    if k < 1: img = cv2.resize(img, (round(iw * k), round(ih * k)), interpolation=cv2.INTER_AREA); s0 /= k; ih, iw = img.shape[:2]
     p = subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS),
                           "-i", "-"] + PRORES + [out], stdin=subprocess.PIPE)
+    ones = np.ones((ih, iw), np.float32)
     for f in range(int(round(dur * FPS))):
         z, cx, cy = kb_at(keys, f / FPS); s = s0 * z
-        cx = min(max(cx, W / (2 * s * iw)), 1 - W / (2 * s * iw)); cy = min(max(cy, H / (2 * s * ih)), 1 - H / (2 * s * ih))
+        if s * iw <= W: cx = 0.5
+        else: cx = min(max(cx, W / (2 * s * iw)), 1 - W / (2 * s * iw))
+        if s * ih <= H: cy = 0.5
+        else: cy = min(max(cy, H / (2 * s * ih)), 1 - H / (2 * s * ih))
         M = np.float32([[s, 0, W / 2 - s * cx * iw], [0, s, H / 2 - s * cy * ih]])
-        p.stdin.write(cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT).tobytes())
+        if bg is None:
+            fr = cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        else:
+            fg = cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT).astype(np.float32)
+            a = cv2.warpAffine(ones, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)[..., None]
+            fr = np.clip(fg * a + bg * (1 - a) + 0.5, 0, 255).astype(np.uint8)
+        p.stdin.write(fr.tobytes())
     p.stdin.close(); p.wait()
 
 
@@ -113,7 +183,7 @@ def build(s, seg):
         run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=0x010101:s={W}x{H}:r=24:d={s['dur']}"] + PRORES + [out]); return out
     tmp = f"{seg}/{s['id']}_pre.mov"
     if k == "still":
-        ken_burns(s["src"], tmp, s["dur"], s.get("kb", [[0, 1.0, 0.5, 0.5], [s["dur"], 1.06, 0.5, 0.5]]))
+        ken_burns(s["src"], tmp, s["dur"], s.get("kb", [[0, 1.0, 0.5, 0.5], [s["dur"], 1.06, 0.5, 0.5]]), s.get("fit"))
     else:
         f = s["dur"] / s["sdur"]; vf = f"setpts=(PTS-STARTPTS)*{f:.6f}"; a = has_audio(s["src"])
         if s.get("vert") is not None:   # a 2.39 strip of a 9:16 frame is a 1.8x blow-up: show the frame instead
@@ -164,7 +234,7 @@ def main(tl_path, out_dir):
     for s in shots:
         t0 = start[s["id"]]
         for f, off, *txt in s.get("vo", []):
-            a = at_lufs(load_audio(f), tl.get("vo_lufs", -16)); place(vo, a, t0 + off)
+            a = at_lufs(declick(load_audio(f), os.path.basename(f)), tl.get("vo_lufs", -16)); place(vo, a, t0 + off)
             subs.append((t0 + off, t0 + off + len(a) / SR, txt))
         if s["kind"] == "ui" and s.get("wav"):
             a = load_audio(s["wav"], s["dur"] + s.get("ss", 0))[int(s.get("ss", 0) * SR):]; a[:F] *= rin; a[-F:] *= rin[::-1]; place(fx, a, t0)
@@ -187,6 +257,7 @@ def main(tl_path, out_dir):
     mix += room_tone(n)
     fo = tl.get("fade_out", 0)
     if fo: k = int(fo * SR); mix[-k:] *= (np.linspace(1, 0, k) ** 2)[:, None]
+    click_scan(mix)
     wav = os.path.join(out_dir, "cut_mix.wav"); write_wav(wav, mix)
 
     with open(os.path.join(out_dir, "cut.srt"), "w", encoding="utf-8") as fh:
