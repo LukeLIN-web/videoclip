@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>审片</title>
+<style>
+:root{--bg:#0d0d0d;--panel:#171717;--line:#2a2a2a;--fg:#ddd;--dim:#888;--acc:#e8b04a}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px -apple-system,"PingFang SC",sans-serif}
+.app{display:grid;grid-template-columns:1fr 340px;height:100vh}
+.stage{display:flex;flex-direction:column;justify-content:center;min-width:0;padding:12px}
+video{width:100%;max-height:calc(100vh - 150px);background:#000}
+video::cue{font-size:20px;background:rgba(0,0,0,.55)}
+.bar{display:flex;gap:12px;align-items:center;color:var(--dim);margin:8px 0}
+#tc{color:var(--acc);font-variant-numeric:tabular-nums;font-size:16px}
+.compose{display:flex;gap:8px}
+textarea{flex:1;height:58px;resize:none;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
+textarea:focus{outline:none;border-color:var(--acc)}
+button{background:var(--acc);color:#000;border:0;border-radius:6px;padding:0 16px;font:inherit;cursor:pointer}
+aside{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+aside h2{font-size:14px;margin:0;padding:12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+#st{color:var(--dim);font-weight:normal}
+#list{overflow:auto;flex:1}
+.n{padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.n:hover{background:#1f1f1f}.n.on{background:#2a2414}
+.n b{color:var(--acc);font-variant-numeric:tabular-nums;margin-right:6px}
+.n .x{float:right;color:var(--dim);border:0;background:none;padding:0 4px}
+.n .x:hover{color:#f66}
+.n .s{color:var(--dim);font-size:12px;margin-top:3px}
+.n .t{white-space:pre-wrap}
+.empty{color:var(--dim);padding:12px}
+@media(max-width:800px){.app{grid-template-columns:1fr;height:auto}aside{border-left:0;max-height:50vh}}
+</style></head><body><div class="app">
+<div class="stage">
+ <video id="v" controls preload="auto"></video>
+ <div class="bar"><span id="tc">00:00.0</span><span id="cutname"></span><span>空格 播放/暂停 · ←/→ 2 秒 · , . 逐帧 · N 写批注</span></div>
+ <div class="compose">
+  <textarea id="txt" placeholder="暂停后在这里写这一秒的问题 · Enter 保存 · Shift+Enter 换行 · Esc 继续播放"></textarea>
+  <button id="save">保存</button>
+ </div>
+</div>
+<aside><h2>批注 <span id="st"></span></h2><div id="list"></div></aside>
+</div><script>
+const CUT=new URLSearchParams(location.search).get('cut')||'rough_v1';  // ?cut=<name> picks the cut
+const v=document.getElementById('v'),txt=document.getElementById('txt'),list=document.getElementById('list'),st=document.getElementById('st');
+document.getElementById('cutname').textContent=CUT+'.mp4';
+v.src=CUT+'.mp4';
+const tr=document.createElement('track');Object.assign(tr,{kind:'subtitles',src:CUT+'.vtt',srclang:'zh',label:'字幕',default:true});v.appendChild(tr);
+const f=t=>String(Math.floor(t/60)).padStart(2,'0')+':'+(t%60).toFixed(1).padStart(4,'0');
+let notes=[],pinned=null;                   // pinned = time captured when you start writing
+v.addEventListener('timeupdate',()=>{document.getElementById('tc').textContent=f(v.currentTime);hl()});
+v.addEventListener('pause',()=>{pinned=v.currentTime;txt.focus()});
+v.addEventListener('play',()=>{pinned=null});
+txt.addEventListener('focus',()=>{if(!v.paused)v.pause();if(pinned==null)pinned=v.currentTime});
+function sub(){const c=v.textTracks[0]&&v.textTracks[0].activeCues;return c&&c.length?[...c].map(x=>x.text.replace(/\n/g,' / ')).join(' '):''}
+async function push(){st.textContent='保存中…';
+ try{const r=await fetch('/api/notes/'+CUT,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(notes)});
+  const j=await r.json();st.textContent=j.ok?`已保存 ${j.n} 条 · ${j.saved}`:'保存失败';}
+ catch(e){st.textContent='保存失败: '+e.message}}
+function add(){const s=txt.value.trim();if(!s)return;
+ const t=pinned!=null?pinned:v.currentTime;
+ notes.push({t:+t.toFixed(2),text:s,sub:sub(),at:new Date().toISOString()});notes.sort((a,b)=>a.t-b.t);
+ txt.value='';render();push();}
+function render(){list.innerHTML=notes.length?'':'<div class="empty">还没有批注。暂停 → 写 → Enter。</div>';
+ notes.forEach((n,i)=>{const d=document.createElement('div');d.className='n';d.dataset.t=n.t;
+  d.innerHTML=`<button class="x" title="删除">✕</button><b>${f(n.t)}</b><span class="t"></span>${n.sub?'<div class="s"></div>':''}`;
+  d.querySelector('.t').textContent=n.text;if(n.sub)d.querySelector('.s').textContent=n.sub;
+  d.onclick=e=>{if(e.target.classList.contains('x')){if(confirm('删除这条？')){notes.splice(i,1);render();push()}return}
+   v.currentTime=n.t;v.pause();pinned=n.t};
+  list.appendChild(d)});hl()}
+function hl(){const t=v.currentTime;list.querySelectorAll('.n').forEach(d=>d.classList.toggle('on',Math.abs(d.dataset.t-t)<0.5))}
+document.getElementById('save').onclick=add;
+txt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();add()}
+ if(e.key==='Escape'){txt.blur();v.play()}});
+document.addEventListener('keydown',e=>{if(e.target===txt)return;
+ if(e.code==='Space'){e.preventDefault();v.paused?v.play():v.pause()}
+ else if(e.code==='ArrowLeft'){e.preventDefault();v.currentTime-=2}
+ else if(e.code==='ArrowRight'){e.preventDefault();v.currentTime+=2}
+ else if(e.key===','){v.pause();v.currentTime-=1/24}
+ else if(e.key==='.'){v.pause();v.currentTime+=1/24}
+ else if(e.key==='n'||e.key==='N'){e.preventDefault();v.pause();txt.focus()}});
+fetch('/api/notes/'+CUT).then(r=>r.json()).then(j=>{notes=j;render()}).catch(()=>render());
+</script></body></html>

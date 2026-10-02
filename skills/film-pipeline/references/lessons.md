@@ -5,8 +5,11 @@
   the aspect was wrong at generation time; a 2.39:1 strip of it is a 2.7× blow-up and looks like mush. Regenerate.
 - **A 2.39 strip of a 9:16 phone video is a ~1.8× blow-up — "you can't see anything".** Show the vertical frame
   (×1.35) centred over a blurred, darkened copy of itself instead.
-- **Ken Burns zoom tops out around 2–2.5×.** An 8× push into a painting read as "zoomed in too far". Same for photos of
-  statues and people.
+- **"放大太大了" came back in every cut (film A v1–v5, film B v1), for photos and videos.** Lowering Ken Burns numbers
+  (8× → 2.5× → 1.6× → 1.1×) never fixed it, because zoom was measured against a 2.39 cover-crop that already threw away
+  ~44% of a 4:3 photo's height — and H3 shots were cropped twice (4:3 → 16:9 first frame → 2.39) plus H3's own push-in.
+  Judge framing against the source: ≥ 80% of it visible at the tightest moment, zoom ≤ 1.15, whole frame over a blurred
+  fill by default. film-assembly's framing gate enforces it; the first-frame crop and H3 push-in are checked by eye.
 - **Generated push-ins drift.** Image-to-video models keep pushing and can arrive somewhere new — a café shot ended on
   a different street with sharp faces. Use the first part of the take, slowed, or go back to the still.
 - **Retimed clips come out about a frame short.** Planned durations drifted 0.6 s over 30 shots; build the timeline
@@ -40,3 +43,7 @@
 - When a version changes only a few shots, copy the unchanged cached segments first; don't regrade everything.
 - A killed job can leave a half-written segment that the cache then trusts — check the last file's duration/decode.
 - Don't publish private data: this repo has no hosts, usernames, absolute paths or source-file names — keep it so.
+- A tmux pane whose ssh has dropped silently falls back to the **local** shell, and the next remote command runs on the
+  laptop. Prefix every remote command with a host guard (`[ "$(hostname)" = <remote> ] && …`) and check the pane's prompt.
+- macOS sandboxed shells can't reach the jump host. ssh, rsync and tmux-ssh need the sandbox lifted, plus a persistent
+  ControlMaster the user opens once (`ssh -MNf -o ControlPersist=yes <alias>`).

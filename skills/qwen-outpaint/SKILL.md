@@ -1,6 +1,6 @@
 ---
 name: qwen-outpaint
-description: Widen portrait (3:4, 9:16) photos to 16:9 with Qwen-Image-2.1 (open weights, diffusers) without changing a single original pixel — grey-pad canvas, fill-only-the-grey prompt, original pasted back with a feathered seam. Use for 扩宽, outpaint, extend photo to widescreen, first frames for image-to-video.
+description: Widen portrait (3:4, 9:16) and 4:3 photos to 16:9 with Qwen-Image-2.1 (open weights, diffusers) without changing a single original pixel — grey-pad canvas, fill-only-the-grey prompt, original pasted back with a feathered seam. Use for 扩宽, outpaint, extend photo to widescreen, first frames for image-to-video.
 ---
 
 # Qwen-Image-2.1 outpaint

@@ -29,10 +29,12 @@ Rewrite `3-*.txt` whenever the workflow changes; keep the old one renamed rather
 ## 3. Generate (remote GPU box, driven through humanize)
 | asset | skill | per item |
 |---|---|---|
-| widen portrait photos to 16:9 | ../qwen-outpaint/SKILL.md | ~50 s |
+| widen portrait/4:3 photos to 16:9 (first frames: outpaint, never crop) | ../qwen-outpaint/SKILL.md | ~50 s |
 | photo→video / text→video, with sound | ../h3-video/SKILL.md | ~4 min |
 | narration, one voice | ../cosyvoice-narration/SKILL.md | 1–2 s/line |
 | score cues | ../acestep-score/SKILL.md | ~20 s/cue |
+**GPU servers are started right before a phase and stopped right after it** (`h3-video/scripts/h3_serve.sh start|stop`;
+CosyVoice/ACE/Qwen/Whisper jobs exit on their own — check nothing of yours is left holding GPUs). The box is shared.
 Two takes of everything. If choosing between models, bake off the 2–3 *hardest* shots (on-screen text, architecture
 lines, an abstract transformation) and let the user decide — then stop testing.
 
@@ -41,8 +43,9 @@ Look before you pick: first/middle/last-frame contact sheets per take, frame-by-
 every VO take (a take much shorter than its twin usually dropped words). Record the pick and the reason in `3-*.txt`.
 
 ## 5. Assemble — ../film-assembly/SKILL.md
-Rough cut from a JSON shot list; CPU-heavy steps (grading, encodes) run on the remote box. Contact-sheet one frame per
-shot and per-shot RMS before showing it to the user.
+Rough cut from a JSON shot list; CPU-heavy steps (grading, encodes) run on the remote box. Before showing it to the user:
+`framing.tsv` clean (no shot shows < 80% of its source — the user's most repeated note is "放大太大了"), a source-vs-cut
+contact sheet per shot, and per-shot RMS.
 
 ## 6. Revise from notes
 Users give notes as timecodes ("50–55 s is blurry"). Map each timecode to the shot through the cut's timeline.json,

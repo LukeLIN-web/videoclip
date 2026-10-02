@@ -7,14 +7,16 @@ TIMELINE.json:
   "shots": [
     {"id": "S04", "kind": "clip", "src": "wall.mp4", "ss": 0, "sdur": 8, "dur": 14,     # retime 8 s of source to 14 s
      "amb": -32,                      # keep the clip's own sound as a bed at this LUFS (omit/null = mute)
-     "vert": -0.4,                    # vertical footage: show it whole (x1.35) over a blurred fill; -1 top .. 1 bottom
+     # framing: any source narrower than 2:1 (9:16 phone, 16:9 H3, 4:3) defaults to "fit" = the WHOLE frame over a blurred
+     # fill; "zoom": 1.1 (<= 1.15) tightens it a little, "y": -1 top .. 1 bottom picks what survives. "fit": "cover"
+     # (2.39 crop, grade flag -y picks the band) keeps only 74% of a 16:9 frame's height and must carry "tight": "<why>".
      "grade": ["-y", "0.2"],          # extra grade.sh flags
      "vo": [["lines/VO01a.wav", 0.8, "中文", "English"]],   # [file, offset in shot, subtitle zh, subtitle en]
      "card": ["chapter_alpha.mov", 0.5]},                  # alpha overlay [file, offset in shot]
     {"id": "S09", "kind": "still", "src": "photo.jpg", "dur": 13,
-     "kb": [[0, 1.0, 0.5, 0.5], [9, 1.6, 0.8, 0.45], [10.5, 1.0, 0.5, 0.5]]},   # keyframes [t, zoom, cx, cy]; zoom <= 1.6
-     # portrait stills default to "fit": whole photo (zoom relative to fit-height) over a blurred fill;
-     # "fit": "cover" forces a 2.39 crop (only ~31% of a 3:4 portrait's height survives — users read it as over-zoomed)
+     "kb": [[0, 1.0, 0.5, 0.5], [9, 1.12, 0.6, 0.45], [10.5, 1.0, 0.5, 0.5]]},   # keyframes [t, zoom, cx, cy]
+     # stills narrower than 2:1 default to "fit": whole photo, zoom relative to fit-height, over a blurred fill.
+     # "fit": "cover" = 2.39 crop: a 4:3 photo keeps 56% of its height AT ZOOM 1.0, a 3:4 one 31% -> needs "tight".
     {"id": "S02", "kind": "ui", "src": "title.mov", "wav": "title.wav", "ss": 1, "dur": 8},
     {"id": "S12", "kind": "clip", "src": "nave.mp4", "sdur": 7, "dur": 7, "silence": true},   # only room tone survives
     {"id": "S25", "kind": "montage", "dur": 8, "cuts": [["S10", 4, 1.2], ["S08", 2, 0.5]]}    # [shot, t in its seg, len]
@@ -22,6 +24,9 @@ TIMELINE.json:
   "cues": [["score/A.flac", "S02", 0, "S06", 2.0]],   # [file, first shot, offset into file, stop at start of shot, fade-out s]
   "fade_out": 1.2, "target_lufs": -18, "vo_lufs": -16, "music_lufs": -23, "duck_db": -6
 }
+Framing gate (runs before anything is built): for every still/clip, the part of the SOURCE visible at its tightest
+moment must be >= 80% of its width and of its height and zoom <= 1.15, else the build stops — unless the shot carries
+"tight": "<why, and that the user asked for it>". Report in OUT_DIR/framing.tsv.
 Writes OUT_DIR/cut.mp4 (H.264 1920x804 24 fps + AAC), cut_mix.wav, cut.srt, timeline.json (real start times).
 """
 import os, sys, json, math, subprocess
@@ -120,6 +125,56 @@ def room_tone(n, rms_db=-50.0):
     return (x * db(rms_db) / np.sqrt((x ** 2).mean())).astype(np.float32)
 
 
+# ------------------------------------------------------------------ framing
+# Zoom is judged against the SOURCE, never against a 2.39 cover-crop. A 4:3 photo cover-cropped to 2.39 shows 56% of its
+# height at "zoom 1.0"; a 4:3 photo cropped to 16:9 for H3 and then to 2.39 shows the same 56%; a 9:16 clip at x1.35 shows
+# 74%. Every one of those was called "放大太大了" — the Ken Burns numbers were small, the crop under them was not.
+MIN_VIS, MAX_ZOOM, MAX_MAG = 0.80, 1.15, 1.5
+
+
+def probe_wh(p, still):
+    if still: h, w = cv2.imread(p, cv2.IMREAD_COLOR).shape[:2]; return w, h          # imread applies EXIF orientation
+    st = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                             "stream=width,height:stream_side_data=rotation", "-of", "json", p]))["streams"][0]
+    rot = next((abs(int(d.get("rotation", 0))) for d in st.get("side_data_list", []) if "rotation" in d), 0)
+    return (st["height"], st["width"]) if rot % 180 == 90 else (st["width"], st["height"])   # ffmpeg autorotates
+
+
+def clip_fit(s, iw, ih):
+    """(mode, zoom, y) for a clip; legacy "vert": y means fit"""
+    if s.get("vert") is not None: return "fit", s.get("zoom", 1.0), s["vert"]
+    return s.get("fit") or ("fit" if iw / ih < 2.0 else "cover"), s.get("zoom", 1.0), s.get("y", 0.0)
+
+
+def framing(s):
+    """visible fraction of the source (width, height) at the tightest moment, and output px per source px"""
+    still = s["kind"] == "still"; iw, ih = probe_wh(s["src"], still)
+    if still:
+        mode = s.get("fit") or ("fit" if iw / ih < 2.0 else "cover")
+        z = max(k[1] for k in s.get("kb", [[0, 1.06]]))
+    else:
+        mode, z, _ = clip_fit(s, iw, ih)
+    sc = (H / ih if mode == "fit" else max(W / iw, H / ih)) * z
+    return dict(id=s["id"], src=f"{iw}x{ih}", mode=mode, zoom=z, vis_w=min(1, W / (sc * iw)), vis_h=min(1, H / (sc * ih)), mag=sc)
+
+
+def framing_gate(shots, out_dir):
+    rows, bad = [], []
+    for s in shots:
+        if s["kind"] not in ("still", "clip"): continue
+        r = framing(s); rows.append(r)
+        flag = r["zoom"] > MAX_ZOOM or min(r["vis_w"], r["vis_h"]) < MIN_VIS
+        if flag and not s.get("tight"): bad.append(r)
+        print(f"  frame {r['id']:>6} {r['src']:>10} {r['mode']:5} zoom {r['zoom']:.2f}  shows {r['vis_w']:4.0%} w x {r['vis_h']:4.0%} h"
+              f"  {r['mag']:.2f} px/px" + ("  TIGHT: " + s["tight"] if flag and s.get("tight") else "  << TOO TIGHT" if flag else "")
+              + ("  << upscaled, soft: regenerate/replace" if r["mag"] > MAX_MAG else ""))
+    with open(os.path.join(out_dir, "framing.tsv"), "w") as fh:
+        fh.write("id\tsrc\tmode\tzoom\tvis_w\tvis_h\tpx_per_px\n")
+        for r in rows: fh.write(f"{r['id']}\t{r['src']}\t{r['mode']}\t{r['zoom']:.2f}\t{r['vis_w']:.2f}\t{r['vis_h']:.2f}\t{r['mag']:.2f}\n")
+    if bad: sys.exit(f"framing gate: {', '.join(r['id'] for r in bad)} show less than {MIN_VIS:.0%} of the source or zoom > "
+                     f"{MAX_ZOOM}. Use the default fit / lower zoom, or add \"tight\": \"<reason>\" if the user asked for it.")
+
+
 # ------------------------------------------------------------------ picture
 def kb_at(keys, t):
     for (t0, *a), (t1, *b) in zip(keys, keys[1:]):
@@ -141,7 +196,7 @@ def blur_fill(img):
 def ken_burns(src, out, dur, keys, fit=None):
     img = cv2.cvtColor(cv2.imread(src, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
     ih, iw = img.shape[:2]
-    fit = fit or ("fit" if ih > iw else "cover")
+    fit = fit or ("fit" if iw / ih < 2.0 else "cover")
     s0 = H / ih if fit == "fit" else max(W / iw, H / ih); bg = blur_fill(img) if fit == "fit" else None
     k = s0 * max(z for _, z, *_ in keys)
     if k < 1: img = cv2.resize(img, (round(iw * k), round(ih * k)), interpolation=cv2.INTER_AREA); s0 /= k; ih, iw = img.shape[:2]
@@ -186,10 +241,11 @@ def build(s, seg):
         ken_burns(s["src"], tmp, s["dur"], s.get("kb", [[0, 1.0, 0.5, 0.5], [s["dur"], 1.06, 0.5, 0.5]]), s.get("fit"))
     else:
         f = s["dur"] / s["sdur"]; vf = f"setpts=(PTS-STARTPTS)*{f:.6f}"; a = has_audio(s["src"])
-        if s.get("vert") is not None:   # a 2.39 strip of a 9:16 frame is a 1.8x blow-up: show the frame instead
-            fh = int(round(H * 1.35)); y = s["vert"]
+        iw, ih = probe_wh(s["src"], False); mode, z, y = clip_fit(s, iw, ih)
+        if mode == "fit":               # whole frame (x zoom) over a blurred, darkened copy of itself
+            fh = 2 * round(H * max(z, 1.0) / 2); fw = 2 * round(iw * fh / ih / 2); cw = min(fw, W)
             vf += (f",split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=40,"
-                   f"eq=brightness=-0.18:saturation=0.7[bg];[b]scale=-2:{fh},crop=iw:{H}:0:(ih-{H})*(0.5+({y})/2)[fg];"
+                   f"eq=brightness=-0.18:saturation=0.7[bg];[b]scale={fw}:{fh}:flags=lanczos,crop={cw}:{H}:(iw-{cw})/2:(ih-{H})*(0.5+({y})/2)[fg];"
                    f"[bg][fg]overlay=(W-w)/2:0,setsar=1[vout]")
             v = ["-filter_complex", "[0:v]" + vf, "-map", "[vout]"] + (["-map", "0:a:0"] if a else [])
         else:
@@ -210,6 +266,7 @@ def main(tl_path, out_dir):
     tl = json.load(open(tl_path, encoding="utf-8")); shots = tl["shots"]
     out_dir = os.path.abspath(out_dir)   # concat.txt resolves relative paths against its own directory
     seg = os.path.join(out_dir, "seg"); os.makedirs(seg, exist_ok=True)
+    framing_gate(shots, out_dir)
     for s in shots:
         s["seg"] = None if s["kind"] == "montage" else build(s, seg)
         # lay the timeline on REAL lengths: retimed clips come out ~1 frame short and planned lengths drift
